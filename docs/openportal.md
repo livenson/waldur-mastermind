@@ -307,6 +307,184 @@ graph LR
 - **Provider Settings**: Configure remote portal endpoints
 - **Default Quotas**: Set standard resource limits per portal
 
+### Remote Project Creation Workflow
+
+When a project needs to be created in a remote OpenPortal instance from the Central Waldur, the process follows a sophisticated workflow through the `ManagedProject` model rather than the traditional Proposal system. Here's how it works:
+
+```mermaid
+flowchart TD
+    subgraph "Remote OpenPortal"
+        RP[Remote Portal User]
+        RPI[Remote Portal Interface]
+        RPAPI[Remote Portal API]
+    end
+    
+    subgraph "Central Waldur"
+        MP[ManagedProject Model]
+        PT[ProjectTemplate]
+        WP[Waldur Project]
+        RA[RemoteAllocation]
+        AS[Approval System]
+        SY[Sync Tasks]
+    end
+    
+    subgraph "Local Resources"
+        MO[Marketplace Offerings]
+        QS[Quota System]
+        BS[Billing System]
+    end
+    
+    RP -->|1. Request Project| RPI
+    RPI -->|2. Send ProjectDetails| RPAPI
+    RPAPI -->|3. POST /managed-projects| MP
+    MP -->|4. Check ProjectTemplate| PT
+    PT -->|5. Verify Limits| AS
+    
+    AS -->|6a. Auto-approve if under limit| MP
+    AS -->|6b. Needs manual approval| MP
+    
+    MP -->|7. Create/Attach| WP
+    WP -->|8. Create| RA
+    RA -->|9. Provision Resources| MO
+    MO -->|10. Set Quotas| QS
+    
+    SY -->|11. Sync Back| RPAPI
+    RPAPI -->|12. Update Status| RPI
+    RP -->|13. Access Granted| RPI
+    
+    QS -->|Usage Tracking| BS
+```
+
+#### ManagedProject Model
+
+The `ManagedProject` model (`waldur_openportal/models.py:1825`) serves as the bridge between remote OpenPortal instances and the central Waldur system:
+
+**Key Fields**:
+- `identifier` - Unique ProjectIdentifier from the remote portal
+- `details` - JSON representation of ProjectDetails from remote
+- `destination` - Remote portal that manages this project
+- `project` - Local Waldur Project (can be null initially)
+- `project_template` - Template defining resource limits and approval rules
+- `local_identifier` - Local portal's project identifier
+
+**State Management**:
+```python
+# ManagedProject inherits from ReviewMixin, providing approval workflow
+class ManagedProject(ReviewMixin, models.Model):
+    # States: DRAFT -> PENDING -> APPROVED/REJECTED
+    # Approval workflow based on ProjectTemplate limits
+```
+
+#### Project Creation Process
+
+1. **Remote Request Arrival**:
+   ```python
+   # Remote portal sends ProjectDetails via API
+   POST /api/openportal-managed-projects/
+   {
+       "identifier": "remote.portal.project123",
+       "details": {
+           "name": "GPU Research Project",
+           "project_template": "gpu-compute",
+           "allocations": [...],
+           "users": [...]
+       }
+   }
+   ```
+
+2. **Template Resolution**:
+   The system resolves the ProjectTemplate based on the remote portal and template name:
+   ```python
+   # ManagedProject.resolve_project_template()
+   template = ProjectTemplate.objects.get(
+       name=details.project_template,
+       portal=remote_portal
+   )
+   ```
+
+3. **Approval Decision**:
+   ```python
+   # ProjectTemplate.action_needs_approval()
+   if template.approval_limit is None:
+       # No approval needed
+       auto_approve = True
+   elif requested_credits > template.approval_limit:
+       # Needs manual approval
+       auto_approve = False
+   ```
+
+4. **Local Project Creation/Attachment**:
+   - **New Project**: Creates a Waldur Project with appropriate customer and metadata
+   - **Existing Project**: Attaches ManagedProject to existing Waldur Project via attach endpoint
+
+5. **Resource Provisioning**:
+   ```python
+   # tasks.create_offerings_for_managed_project()
+   for offering in managed_project.get_default_offerings():
+       resource = marketplace_models.Resource.objects.create(
+           offering=offering,
+           project=project,
+           limits=calculated_limits
+       )
+   ```
+
+#### Approval Workflow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Draft: Remote Request
+    Draft --> Pending: Exceeds Auto-Approval Limit
+    Draft --> Approved: Within Auto-Approval Limit
+    Pending --> Approved: Admin Approves
+    Pending --> Rejected: Admin Rejects
+    Approved --> Active: Resources Provisioned
+    Rejected --> [*]: Request Denied
+    Active --> Detached: Project Detached
+    Detached --> Active: Project Re-attached
+```
+
+**Approval Limits Configuration**:
+- `approval_limit` - Credits threshold requiring approval (null = no approval needed)
+- `max_credit_limit` - Maximum credits allowed (null = no maximum)
+
+**Manual Approval Process**:
+```python
+# Admin approves via API
+POST /api/openportal-managed-projects/{identifier}/approve/
+{
+    "comment": "Approved for research purposes"
+}
+
+# This triggers:
+# 1. State change to APPROVED
+# 2. Project creation in local Waldur
+# 3. RemoteAllocation creation
+# 4. Sync back to remote portal
+```
+
+#### Synchronization Mechanism
+
+The `sync_remote` task (runs every 29 minutes) handles bidirectional synchronization:
+
+```python
+@shared_task
+def sync_remote():
+    # Process pending ManagedProjects
+    for managed_project in ManagedProject.objects.filter(
+        state=ReviewStates.PENDING
+    ):
+        if managed_project.can_auto_approve():
+            managed_project.approve()
+            create_local_resources(managed_project)
+            
+    # Sync approved projects back to remote
+    for managed_project in ManagedProject.objects.filter(
+        state=ReviewStates.APPROVED,
+        project__isnull=False
+    ):
+        sync_to_remote_portal(managed_project)
+```
+
 ### Advanced Federation Features
 
 **ManagedProject Integration**:
