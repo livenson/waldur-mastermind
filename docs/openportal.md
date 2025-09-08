@@ -485,6 +485,274 @@ def sync_remote():
         sync_to_remote_portal(managed_project)
 ```
 
+### Use Cases with Sequence Diagrams
+
+#### Membership Management
+
+The OpenPortal federation handles complex membership scenarios where users can be added/removed from projects in either the central or remote portals, requiring sophisticated synchronization.
+
+##### Use Case 1: User Added to Project in Central Waldur
+
+```mermaid
+sequenceDiagram
+    participant Admin as Central Admin
+    participant CW as Central Waldur
+    participant AS as Association System
+    participant ST as Sync Tasks
+    participant ROP as Remote OpenPortal
+    participant RU as Remote Users
+    
+    Admin->>CW: Grant user role in project
+    CW->>AS: role_granted signal
+    AS->>AS: Create/Update Association
+    AS->>ST: Schedule sync task
+    
+    Note over ST: sync task (runs every 59 min)
+    ST->>CW: Query project memberships
+    CW->>ST: Return user roles
+    ST->>ROP: Add user to remote project
+    ROP->>RU: Create account & add to group
+    ROP-->>ST: Confirm user added
+    ST->>AS: Update Association status
+    
+    Note over AS,ROP: Conflict Detection
+    alt User already exists with different role
+        ROP-->>ST: Role conflict detected
+        ST->>AS: Log conflict, use central role
+        AS->>ROP: Update remote role
+    end
+```
+
+##### Use Case 2: User Removed from Project (Central → Remote)
+
+```mermaid
+sequenceDiagram
+    participant Admin as Central Admin
+    participant CW as Central Waldur
+    participant AS as Association System
+    participant ST as Sync Tasks
+    participant ROP as Remote OpenPortal
+    
+    Admin->>CW: Revoke user role from project
+    CW->>AS: role_revoked signal
+    AS->>ST: Schedule full sync
+    
+    ST->>CW: Query all user associations
+    CW->>ST: Return current roles
+    ST->>AS: Compare with stored associations
+    AS->>ST: Identify orphaned associations
+    ST->>ROP: Remove user from project group
+    ROP-->>ST: Confirm removal
+    ST->>AS: Delete Association record
+    
+    Note over ST,ROP: Grace Period
+    ST->>ST: Wait 24h before account deletion
+    ST->>ROP: Deactivate user account if no other projects
+```
+
+##### Use Case 3: Bidirectional Membership Conflict Resolution
+
+```mermaid
+sequenceDiagram
+    participant CU as Central User
+    participant CW as Central Waldur
+    participant RU as Remote User  
+    participant ROP as Remote OpenPortal
+    participant CR as Conflict Resolver
+    participant ST as Sync Task
+    
+    Note over CU,ROP: Concurrent Changes
+    CU->>CW: Admin grants "Manager" role
+    RU->>ROP: Admin grants "Member" role
+    
+    Note over ST: Sync cycle detects conflict
+    ST->>CW: Query user roles
+    CW-->>ST: User is "Manager"
+    ST->>ROP: Query user roles  
+    ROP-->>ST: User is "Member"
+    
+    ST->>CR: Resolve role conflict
+    CR->>CR: Apply resolution policy
+    
+    alt Central Authority Policy (Default)
+        CR->>ST: Central role takes precedence
+        ST->>ROP: Update to "Manager"
+        ST->>CW: Log conflict resolution
+    else Time-based Policy
+        CR->>CR: Check modification timestamps
+        CR->>ST: Latest change wins
+    else Manual Resolution Required
+        CR->>ST: Flag for admin review
+        ST->>CW: Create conflict notification
+    end
+```
+
+#### Allocation Management
+
+Allocation changes require careful coordination between central billing and remote resource limits.
+
+##### Use Case 4: Allocation Increase in Central Waldur
+
+```mermaid
+sequenceDiagram
+    participant PM as Project Manager
+    participant CW as Central Waldur
+    participant MP as Marketplace
+    participant RA as RemoteAllocation
+    participant VT as Version Tracker
+    participant ST as Sync Tasks
+    participant ROP as Remote OpenPortal
+    
+    PM->>CW: Request allocation increase
+    CW->>MP: Process marketplace order
+    MP->>RA: Update allocation limits
+    RA->>VT: Increment local_version
+    RA->>ST: Schedule remote sync
+    
+    Note over ST: sync_remote task (every 29 min)
+    ST->>RA: Check needs_updating()
+    RA-->>ST: local_version > remote_version
+    ST->>ROP: Update allocation limits
+    
+    alt Success
+        ROP-->>ST: Allocation updated
+        ST->>RA: successfully_updated(version)
+        RA->>VT: remote_version = local_version
+        ST->>CW: Update billing records
+    else Failure - Insufficient Resources
+        ROP-->>ST: Error: Quota exceeded
+        ST->>RA: Log sync failure
+        ST->>CW: Create admin notification
+        RA->>VT: Keep version mismatch for retry
+    else Failure - Concurrent Update
+        ROP-->>ST: Error: Version conflict
+        ST->>RA: Increment local_version again
+        ST->>ST: Retry in next cycle
+    end
+```
+
+##### Use Case 5: Remote Allocation Change Propagation
+
+```mermaid
+sequenceDiagram
+    participant RA as Remote Admin
+    participant ROP as Remote OpenPortal
+    participant ST as Sync Tasks
+    participant CRA as Central RemoteAllocation
+    participant CB as Central Billing
+    participant CW as Central Waldur
+    
+    RA->>ROP: Modify allocation (emergency increase)
+    ROP->>ROP: Update local allocation
+    
+    Note over ST: sync_remote_usage task (every 9 min)
+    ST->>ROP: Query allocation status
+    ROP-->>ST: Return updated limits & usage
+    ST->>CRA: Compare with local records
+    
+    alt Authorized Change
+        CRA->>CB: Update billing limits
+        CB->>CW: Adjust project quotas
+        ST->>CW: Log authorized change
+    else Unauthorized Change  
+        ST->>CW: Create policy violation alert
+        CW->>RA: Send notification
+        ST->>ROP: Revert to authorized limits
+        ROP-->>ST: Confirm reversion
+    end
+    
+    ST->>CB: Reconcile usage charges
+    CB->>CW: Update invoice adjustments
+```
+
+#### Conflict Resolution Mechanisms
+
+The system implements multiple strategies to handle conflicts in federated environments:
+
+##### Version-Based Conflict Resolution
+
+```python
+class RemoteAllocation:
+    def needs_updating(self) -> bool:
+        """Version-based conflict detection"""
+        return self.local_version > self.remote_version
+    
+    def successfully_updated(self, version: int):
+        """Atomic version update with conflict checking"""
+        if version < self.remote_version:
+            # Someone already updated
+            logger.warning("Version conflict detected")
+            return False
+        self.remote_version = version
+        return True
+```
+
+##### Conflict Resolution Policies
+
+1. **Central Authority (Default)**:
+   ```python
+   # Central Waldur roles override remote changes
+   if central_role != remote_role:
+       sync_to_remote(central_role)
+   ```
+
+2. **Timestamp-Based**:
+   ```python
+   # Latest modification wins
+   if central_timestamp > remote_timestamp:
+       sync_to_remote(central_data)
+   else:
+       sync_to_central(remote_data)
+   ```
+
+3. **Manual Resolution**:
+   ```python
+   # Flag conflicts for admin review
+   if detect_conflict():
+       create_admin_notification()
+       pause_sync_until_resolved()
+   ```
+
+##### Use Case 6: Complex Multi-Portal Conflict
+
+```mermaid
+sequenceDiagram
+    participant P1 as Portal 1 Admin
+    participant P2 as Portal 2 Admin
+    participant CW as Central Waldur
+    participant CR as Conflict Resolver
+    participant NT as Notification System
+    
+    Note over P1,P2: Concurrent Operations
+    P1->>CW: Add User A to Project X (Manager)
+    P2->>CW: Add User A to Project X (Member)
+    
+    CW->>CR: Detect role conflict
+    CR->>CR: Check resolution policy
+    
+    alt Hierarchical Resolution
+        CR->>CR: Manager > Member priority
+        CR->>CW: Set role to Manager
+        CR->>P2: Notify of role escalation
+    else Site Priority Resolution
+        CR->>CR: Portal 1 has higher priority
+        CR->>CW: Use Portal 1's role
+        CR->>P2: Notify role was overridden
+    else Escalation Required
+        CR->>NT: Create conflict notification
+        NT->>P1: Request confirmation
+        NT->>P2: Request confirmation
+        
+        Note over NT: Wait for manual resolution
+        P1->>NT: Confirm Manager role needed
+        NT->>CW: Apply confirmed role
+        NT->>P2: Notify final resolution
+    end
+    
+    CW->>CW: Update all affected portals
+    CW->>NT: Log resolution for audit
+```
+
 ### Advanced Federation Features
 
 **ManagedProject Integration**:
